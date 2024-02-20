@@ -42,6 +42,7 @@ static int fd = -1;
 /* Returns 0 on failure, 1 on success */
 int uevent_init()
 {
+#if 0
     struct sockaddr_nl addr;
     int sz = 64*1024;
     int s;
@@ -64,15 +65,23 @@ int uevent_init()
 
     fd = s;
     return (fd > 0);
+#else
+    return 1;
+#endif
 }
 
 int uevent_get_fd()
 {
+#if 0
     return fd;
+#else
+    return 0;
+#endif
 }
 
 int uevent_next_event(char* buffer, int buffer_length)
 {
+#if 0
     while (1) {
         struct pollfd fds;
         int nr;
@@ -98,6 +107,13 @@ int uevent_next_event(char* buffer, int buffer_length)
     
     // won't get here
     return 0;
+#else
+    while (1)
+    {
+        sleep(10);
+    }
+    return 0;
+#endif
 }
 
 int uevent_add_native_handler(void (*handler)(void *data, const char *msg, int msg_len),
