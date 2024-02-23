@@ -13,8 +13,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+// ananbox: fake wifi, reference: github.com/vmos-dev
 
 #include <stdlib.h>
+#include <string.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <string.h>
@@ -132,6 +134,17 @@ static char supplicant_name[PROPERTY_VALUE_MAX];
 /* Is either SUPP_PROP_NAME or P2P_PROP_NAME */
 static char supplicant_prop_name[PROPERTY_KEY_MAX];
 
+int has_wifi_driver_loaded = 0;
+int is_wifi_supplicant_connection_active = 0;
+int is_ctrl_event_connected = 0;
+int is_wifi_reconnect = 0;
+
+static char default_mac[20] = "12:34:56:78:9a:bc";
+static char default_ssid[20] = "WIFI";
+static char default_ip[20] = "10.254.1.123";
+
+static int sock_sv[2];
+
 static int insmod(const char *filename, const char *args)
 {
     void *module;
@@ -170,24 +183,13 @@ static int rmmod(const char *modname)
 
 int do_dhcp_request(int *ipaddr, int *gateway, int *mask,
                     int *dns1, int *dns2, int *server, int *lease) {
-    /* For test driver, always report success */
-    if (strcmp(primary_iface, WIFI_TEST_INTERFACE) == 0)
-        return 0;
-
-    if (ifc_init() < 0)
-        return -1;
-
-    if (do_dhcp(primary_iface) < 0) {
-        ifc_close();
-        return -1;
-    }
-    ifc_close();
-    get_dhcp_info(ipaddr, gateway, mask, dns1, dns2, server, lease);
+    ALOGD("REDF-LOG get_dhcp_error_string\n");
     return 0;
 }
 
 const char *get_dhcp_error_string() {
-    return dhcp_lasterror();
+    ALOGD("REDF-LOG get_dhcp_error_string\n");
+    return "not supported!";
 }
 
 #ifdef WIFI_DRIVER_STATE_CTRL_PARAM
@@ -215,538 +217,358 @@ int wifi_change_driver_state(const char *state)
 #endif
 
 int is_wifi_driver_loaded() {
-    char driver_status[PROPERTY_VALUE_MAX];
-#ifdef WIFI_DRIVER_MODULE_PATH
-    FILE *proc;
-    char line[sizeof(DRIVER_MODULE_TAG)+10];
-#endif
-
-    if (!property_get(DRIVER_PROP_NAME, driver_status, NULL)
-            || strcmp(driver_status, "ok") != 0) {
-        return 0;  /* driver not loaded */
-    }
-#ifdef WIFI_DRIVER_MODULE_PATH
-    /*
-     * If the property says the driver is loaded, check to
-     * make sure that the property setting isn't just left
-     * over from a previous manual shutdown or a runtime
-     * crash.
-     */
-    if ((proc = fopen(MODULE_FILE, "r")) == NULL) {
-        ALOGW("Could not open %s: %s", MODULE_FILE, strerror(errno));
-        property_set(DRIVER_PROP_NAME, "unloaded");
-        return 0;
-    }
-    while ((fgets(line, sizeof(line), proc)) != NULL) {
-        if (strncmp(line, DRIVER_MODULE_TAG, strlen(DRIVER_MODULE_TAG)) == 0) {
-            fclose(proc);
-            return 1;
-        }
-    }
-    fclose(proc);
-    property_set(DRIVER_PROP_NAME, "unloaded");
-    return 0;
-#else
-    return 1;
-#endif
+    return has_wifi_driver_loaded;
 }
 
 int wifi_load_driver()
 {
-#ifdef WIFI_DRIVER_MODULE_PATH
-    char driver_status[PROPERTY_VALUE_MAX];
-    int count = 100; /* wait at most 20 seconds for completion */
+    ALOGD("REDF-LOG wifi_load_driver\n");
+    has_wifi_driver_loaded = 1;
+    is_ctrl_event_connected = 1;
 
-    if (is_wifi_driver_loaded()) {
-        return 0;
-    }
-
-    if (insmod(DRIVER_MODULE_PATH, DRIVER_MODULE_ARG) < 0)
-        return -1;
-
-    if (strcmp(FIRMWARE_LOADER,"") == 0) {
-        /* usleep(WIFI_DRIVER_LOADER_DELAY); */
+    if (sock_sv[0] > 0 || socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sock_sv) >= 0)
+    {
         property_set(DRIVER_PROP_NAME, "ok");
-    }
-    else {
-        property_set("ctl.start", FIRMWARE_LOADER);
-    }
-    sched_yield();
-    while (count-- > 0) {
-        if (property_get(DRIVER_PROP_NAME, driver_status, NULL)) {
-            if (strcmp(driver_status, "ok") == 0)
-                return 0;
-            else if (strcmp(driver_status, "failed") == 0) {
-                wifi_unload_driver();
-                return -1;
-            }
-        }
-        usleep(200000);
-    }
-    property_set(DRIVER_PROP_NAME, "timeout");
-    wifi_unload_driver();
-    return -1;
-#else
-#ifdef WIFI_DRIVER_STATE_CTRL_PARAM
-    if (is_wifi_driver_loaded()) {
         return 0;
     }
-
-    if (wifi_change_driver_state(WIFI_DRIVER_STATE_ON) < 0)
-        return -1;
-#endif
-    property_set(DRIVER_PROP_NAME, "ok");
-    return 0;
-#endif
+    ALOGE("REDF-LOG wifi_load_driver Could not create socketpair %s\n", strerror(errno));
+    return -1; 
 }
 
 int wifi_unload_driver()
 {
-    usleep(200000); /* allow to finish interface down */
-#ifdef WIFI_DRIVER_MODULE_PATH
-    if (rmmod(DRIVER_MODULE_NAME) == 0) {
-        int count = 20; /* wait at most 10 seconds for completion */
-        while (count-- > 0) {
-            if (!is_wifi_driver_loaded())
-                break;
-            usleep(500000);
-        }
-        usleep(500000); /* allow card removal */
-        if (count) {
-            return 0;
-        }
-        return -1;
-    } else
-        return -1;
-#else
-#ifdef WIFI_DRIVER_STATE_CTRL_PARAM
-    if (is_wifi_driver_loaded()) {
-        if (wifi_change_driver_state(WIFI_DRIVER_STATE_OFF) < 0)
-            return -1;
-    }
-#endif
+    ALOGE("REDF-LOG wifi unload driver\n");
+    has_wifi_driver_loaded = 0;
+    is_ctrl_event_connected = 0;
+    is_wifi_reconnect = 0;
     property_set(DRIVER_PROP_NAME, "unloaded");
+
     return 0;
-#endif
 }
 
 int ensure_entropy_file_exists()
 {
-    int ret;
-    int destfd;
-
-    ret = access(SUPP_ENTROPY_FILE, R_OK|W_OK);
-    if ((ret == 0) || (errno == EACCES)) {
-        if ((ret != 0) &&
-            (chmod(SUPP_ENTROPY_FILE, S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP) != 0)) {
-            ALOGE("Cannot set RW to \"%s\": %s", SUPP_ENTROPY_FILE, strerror(errno));
-            return -1;
-        }
-        return 0;
-    }
-    destfd = TEMP_FAILURE_RETRY(open(SUPP_ENTROPY_FILE, O_CREAT|O_RDWR, 0660));
-    if (destfd < 0) {
-        ALOGE("Cannot create \"%s\": %s", SUPP_ENTROPY_FILE, strerror(errno));
-        return -1;
-    }
-
-    if (TEMP_FAILURE_RETRY(write(destfd, dummy_key, sizeof(dummy_key))) != sizeof(dummy_key)) {
-        ALOGE("Error writing \"%s\": %s", SUPP_ENTROPY_FILE, strerror(errno));
-        close(destfd);
-        return -1;
-    }
-    close(destfd);
-
-    /* chmod is needed because open() didn't set permisions properly */
-    if (chmod(SUPP_ENTROPY_FILE, 0660) < 0) {
-        ALOGE("Error changing permissions of %s to 0660: %s",
-             SUPP_ENTROPY_FILE, strerror(errno));
-        unlink(SUPP_ENTROPY_FILE);
-        return -1;
-    }
-
-    if (chown(SUPP_ENTROPY_FILE, AID_SYSTEM, AID_WIFI) < 0) {
-        ALOGE("Error changing group ownership of %s to %d: %s",
-             SUPP_ENTROPY_FILE, AID_WIFI, strerror(errno));
-        unlink(SUPP_ENTROPY_FILE);
-        return -1;
-    }
-    return 0;
+    ALOGE("REDF-LOG ensure_entropy_file_exists\n");
+    return -1;
 }
 
 int ensure_config_file_exists(const char *config_file)
 {
-    char buf[2048];
-    int srcfd, destfd;
-    struct stat sb;
-    int nread;
-    int ret;
-
-    ret = access(config_file, R_OK|W_OK);
-    if ((ret == 0) || (errno == EACCES)) {
-        if ((ret != 0) &&
-            (chmod(config_file, S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP) != 0)) {
-            ALOGE("Cannot set RW to \"%s\": %s", config_file, strerror(errno));
-            return -1;
-        }
-        return 0;
-    } else if (errno != ENOENT) {
-        ALOGE("Cannot access \"%s\": %s", config_file, strerror(errno));
-        return -1;
-    }
-
-    srcfd = TEMP_FAILURE_RETRY(open(SUPP_CONFIG_TEMPLATE, O_RDONLY));
-    if (srcfd < 0) {
-        ALOGE("Cannot open \"%s\": %s", SUPP_CONFIG_TEMPLATE, strerror(errno));
-        return -1;
-    }
-
-    destfd = TEMP_FAILURE_RETRY(open(config_file, O_CREAT|O_RDWR, 0660));
-    if (destfd < 0) {
-        close(srcfd);
-        ALOGE("Cannot create \"%s\": %s", config_file, strerror(errno));
-        return -1;
-    }
-
-    while ((nread = TEMP_FAILURE_RETRY(read(srcfd, buf, sizeof(buf)))) != 0) {
-        if (nread < 0) {
-            ALOGE("Error reading \"%s\": %s", SUPP_CONFIG_TEMPLATE, strerror(errno));
-            close(srcfd);
-            close(destfd);
-            unlink(config_file);
-            return -1;
-        }
-        TEMP_FAILURE_RETRY(write(destfd, buf, nread));
-    }
-
-    close(destfd);
-    close(srcfd);
-
-    /* chmod is needed because open() didn't set permisions properly */
-    if (chmod(config_file, 0660) < 0) {
-        ALOGE("Error changing permissions of %s to 0660: %s",
-             config_file, strerror(errno));
-        unlink(config_file);
-        return -1;
-    }
-
-    if (chown(config_file, AID_SYSTEM, AID_WIFI) < 0) {
-        ALOGE("Error changing group ownership of %s to %d: %s",
-             config_file, AID_WIFI, strerror(errno));
-        unlink(config_file);
-        return -1;
-    }
-    return 0;
+    ALOGE("REDF-LOG ensure_config_file_exists, config_file: %s\n", config_file);
+    return -1;
 }
 
 int wifi_start_supplicant(int p2p_supported)
 {
-    char supp_status[PROPERTY_VALUE_MAX] = {'\0'};
-    int count = 200; /* wait at most 20 seconds for completion */
-    const prop_info *pi;
-    unsigned serial = 0, i;
+    property_set("ctl.start", SUPPLICANT_NAME);
+    is_wifi_supplicant_connection_active = 1;
 
-    if (p2p_supported) {
-        strcpy(supplicant_name, P2P_SUPPLICANT_NAME);
-        strcpy(supplicant_prop_name, P2P_PROP_NAME);
+    ALOGE("REDF-LOG wifi_start_supplicant, p2p_supported: %d\n", p2p_supported);
 
-        /* Ensure p2p config file is created */
-        if (ensure_config_file_exists(P2P_CONFIG_FILE) < 0) {
-            ALOGE("Failed to create a p2p config file");
-            return -1;
-        }
-
-    } else {
-        strcpy(supplicant_name, SUPPLICANT_NAME);
-        strcpy(supplicant_prop_name, SUPP_PROP_NAME);
-    }
-
-    /* Check whether already running */
-    if (property_get(supplicant_prop_name, supp_status, NULL)
-            && strcmp(supp_status, "running") == 0) {
-        return 0;
-    }
-
-    /* Before starting the daemon, make sure its config file exists */
-    if (ensure_config_file_exists(SUPP_CONFIG_FILE) < 0) {
-        ALOGE("Wi-Fi will not be enabled");
-        return -1;
-    }
-
-    if (ensure_entropy_file_exists() < 0) {
-        ALOGE("Wi-Fi entropy file was not created");
-    }
-
-    /* Clear out any stale socket files that might be left over. */
-    wpa_ctrl_cleanup();
-
-    /* Reset sockets used for exiting from hung state */
-    exit_sockets[0] = exit_sockets[1] = -1;
-
-    /*
-     * Get a reference to the status property, so we can distinguish
-     * the case where it goes stopped => running => stopped (i.e.,
-     * it start up, but fails right away) from the case in which
-     * it starts in the stopped state and never manages to start
-     * running at all.
-     */
-    pi = __system_property_find(supplicant_prop_name);
-    if (pi != NULL) {
-        serial = __system_property_serial(pi);
-    }
-    property_get("wifi.interface", primary_iface, WIFI_TEST_INTERFACE);
-
-    property_set("ctl.start", supplicant_name);
-    sched_yield();
-
-    while (count-- > 0) {
-        if (pi == NULL) {
-            pi = __system_property_find(supplicant_prop_name);
-        }
-        if (pi != NULL) {
-            /*
-             * property serial updated means that init process is scheduled
-             * after we sched_yield, further property status checking is based on this */
-            if (__system_property_serial(pi) != serial) {
-                __system_property_read(pi, NULL, supp_status);
-                if (strcmp(supp_status, "running") == 0) {
-                    return 0;
-                } else if (strcmp(supp_status, "stopped") == 0) {
-                    return -1;
-                }
-            }
-        }
-        usleep(100000);
-    }
-    return -1;
+    return 0;
 }
 
 int wifi_stop_supplicant(int p2p_supported)
 {
-    char supp_status[PROPERTY_VALUE_MAX] = {'\0'};
-    int count = 50; /* wait at most 5 seconds for completion */
-
-    if (p2p_supported) {
-        strcpy(supplicant_name, P2P_SUPPLICANT_NAME);
-        strcpy(supplicant_prop_name, P2P_PROP_NAME);
-    } else {
-        strcpy(supplicant_name, SUPPLICANT_NAME);
-        strcpy(supplicant_prop_name, SUPP_PROP_NAME);
-    }
-
-    /* Check whether supplicant already stopped */
-    if (property_get(supplicant_prop_name, supp_status, NULL)
-        && strcmp(supp_status, "stopped") == 0) {
-        return 0;
-    }
-
-    property_set("ctl.stop", supplicant_name);
-    sched_yield();
-
-    while (count-- > 0) {
-        if (property_get(supplicant_prop_name, supp_status, NULL)) {
-            if (strcmp(supp_status, "stopped") == 0)
-                return 0;
-        }
-        usleep(100000);
-    }
-    ALOGE("Failed to stop supplicant");
-    return -1;
+    is_wifi_supplicant_connection_active = 0;
+    ALOGE("REDF-LOG wifi_stop_supplicant, p2p_supported: %d\n", p2p_supported);
+    return 0;
 }
 
 int wifi_connect_on_socket_path(const char *path)
 {
-    char supp_status[PROPERTY_VALUE_MAX] = {'\0'};
-
-    /* Make sure supplicant is running */
-    if (!property_get(supplicant_prop_name, supp_status, NULL)
-            || strcmp(supp_status, "running") != 0) {
-        ALOGE("Supplicant not running, cannot connect");
-        return -1;
-    }
-
-    ctrl_conn = wpa_ctrl_open(path);
-    if (ctrl_conn == NULL) {
-        ALOGE("Unable to open connection to supplicant on \"%s\": %s",
-             path, strerror(errno));
-        return -1;
-    }
-    monitor_conn = wpa_ctrl_open(path);
-    if (monitor_conn == NULL) {
-        wpa_ctrl_close(ctrl_conn);
-        ctrl_conn = NULL;
-        return -1;
-    }
-    if (wpa_ctrl_attach(monitor_conn) != 0) {
-        wpa_ctrl_close(monitor_conn);
-        wpa_ctrl_close(ctrl_conn);
-        ctrl_conn = monitor_conn = NULL;
-        return -1;
-    }
-
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, exit_sockets) == -1) {
-        wpa_ctrl_close(monitor_conn);
-        wpa_ctrl_close(ctrl_conn);
-        ctrl_conn = monitor_conn = NULL;
-        return -1;
-    }
-
-    return 0;
+    ALOGE("REDF-LOG wifi_connect_on_socket_path, path: %s\n", path);
+    return -1;
 }
 
 /* Establishes the control and monitor socket connections on the interface */
 int wifi_connect_to_supplicant()
 {
-    static char path[PATH_MAX];
+    ALOGD("REDF-LOG wifi_connect_to_supplicant\n");
+    return 0;
+}
 
-    if (access(IFACE_DIR, F_OK) == 0) {
-        snprintf(path, sizeof(path), "%s/%s", IFACE_DIR, primary_iface);
-    } else {
-        snprintf(path, sizeof(path), "@android:wpa_%s", primary_iface);
+int send_data(char *data)
+{
+    if (is_ctrl_event_connected)
+    {
+        int result = write(sock_sv[1], data, strlen(data) + 1);
+        if (result >= 0)
+        {
+            ALOGE("REDF-LOG send data[%s]\n", data);
+            return result;
+        }
+        ALOGE("REDF-LOG send data error! %s\n", strerror(errno));
     }
-    return wifi_connect_on_socket_path(path);
+    else
+    {
+        ALOGE("REDF-LOG send data error! current wap connect is TERMINATED\n");
+    }
+    return 0;
 }
 
 int wifi_send_command(const char *cmd, char *reply, size_t *reply_len)
 {
-    int ret;
-    if (ctrl_conn == NULL) {
-        ALOGV("Not connected to wpa_supplicant - \"%s\" command dropped.\n", cmd);
-        return -1;
+    if (strstr(cmd, "wlan0 DRIVER "))
+    {
+        if (strstr(cmd, "wlan0 DRIVER MACADDR"))
+        {
+            char mac_address[PROPERTY_VALUE_MAX] = {0};
+            property_get("ro.ananbox.wifi.bssid", mac_address, default_mac);
+            snprintf(reply, *reply_len, "Macaddr = %s", mac_address);
+            goto finalret;
+        }
+        snprintf(reply, *reply_len, "OK");
+        goto finalret;
     }
-    ret = wpa_ctrl_request(ctrl_conn, cmd, strlen(cmd), reply, reply_len, NULL);
-    if (ret == -2) {
-        ALOGD("'%s' command timed out.\n", cmd);
-        /* unblocks the monitor receive socket for termination */
-        TEMP_FAILURE_RETRY(write(exit_sockets[0], "T", 1));
-        return -2;
-    } else if (ret < 0 || strncmp(reply, "FAIL", 4) == 0) {
-        return -1;
+    else if (strstr(cmd, "wlan0 LIST_NETWORKS"))
+    {
+        if (strstr(cmd, "LAST_ID=-1"))
+        {
+            char ssid[PROPERTY_VALUE_MAX] = {0};
+            property_get("ro.ananbox.wifi.ssid", ssid, default_ssid);
+            snprintf(reply, *reply_len, "network id / ssid / bssid / flags\n0\t%s\tany", ssid);
+            goto finalret;
+        }
+        else
+        {
+            snprintf(reply, *reply_len, "network id / ssid / bssid / flags");
+            goto finalret;
+        }
     }
-    if (strncmp(cmd, "PING", 4) == 0) {
-        reply[*reply_len] = '\0';
+    else if (strstr(cmd, "wlan0 GET_NETWORK"))
+    {
+        if (strstr(cmd, " ssid"))
+        {
+            char ssid[PROPERTY_VALUE_MAX] = {0};
+            property_get("ro.ananbox.wifi.ssid", ssid, default_ssid);
+            snprintf(reply, *reply_len, "\"%s\"", ssid);
+            goto finalret;
+        }
+        else if (strstr(cmd, " bssid"))
+        {
+            char mac_address[PROPERTY_VALUE_MAX] = {0};
+            property_get("ro.ananbox.wifi.bssid", mac_address, default_mac);
+            snprintf(reply, *reply_len, "%s", mac_address);
+            goto finalret;
+        }
+        else if (strstr(cmd, "priority"))
+        {
+            snprintf(reply, *reply_len, "2");
+            goto finalret;
+        }
+        else if (strstr(cmd, "sim_num"))
+        {
+            snprintf(reply, *reply_len, "1");
+            goto finalret;
+        }
+        else if (strstr(cmd, "scan_ssid") || strstr(cmd, "mode") || strstr(cmd, "frequency") || strstr(cmd, "wep_tx_keyidx"))
+        {
+            snprintf(reply, *reply_len, "0");
+            goto finalret;
+        }
+        else if (strstr(cmd, "proto"))
+        {
+            snprintf(reply, *reply_len, "WPA_RSN");
+            goto finalret;
+        }
+        else if (strstr(cmd, "key_mgmt"))
+        {
+            snprintf(reply, *reply_len, "NONE");
+            goto finalret;
+        }
+        if (strstr(cmd, "pairwise"))
+        {
+            snprintf(reply, *reply_len, "CCMP TKIP");
+            goto finalret;
+        }
+        if (strstr(cmd, "group"))
+        {
+            snprintf(reply, *reply_len, "CCMP TKIP WEP104 WEP40");
+            goto finalret;
+        }
+        if (strstr(cmd, "engine"))
+        {
+            snprintf(reply, *reply_len, "0");
+            goto finalret;
+        }
     }
+    else
+    {
+        if (strstr(cmd, "wlan0 GET_CAPABILITY modes"))
+        {
+            snprintf(reply, *reply_len, "IBSS AP");
+            goto finalret;
+        }
+        if (strstr(cmd, "wlan0 SCAN_INTERVAL") || strstr(cmd, "wlan0 STA_AUTOCONNECT"))
+        {
+            snprintf(reply, *reply_len, "OK");
+            goto finalret;
+        }
+        if (!strcmp(cmd, "IFNAME=wlan0 STATUS") || strstr(cmd, "wlan0 STATUS-NO_EVENTS"))
+        {
+            if (is_wifi_reconnect)
+            {
+                char ssid[PROPERTY_VALUE_MAX] = {0};
+                char mac_address[PROPERTY_VALUE_MAX] = {0};
+                char ip_address[PROPERTY_VALUE_MAX] = {0};
+                property_get("ro.ananbox.wifi.bssid", mac_address, default_mac);
+                property_get("ro.ananbox.wifi.ip", ip_address, default_ip);
+                property_get("ro.ananbox.wifi.ssid", ssid, default_ssid);
+                snprintf(reply, *reply_len, "bssid=%s\nfreq=2412\nssid=%s\nid=0\nmode=station\npairwise_cipher=NONE\ngroup_cipher=NONE\nkey_mgmt=NONE\nwpa_state=COMPLETED\nip_address=%s", mac_address, ssid, ip_address);
+                goto finalret;
+            }
+            snprintf(reply, *reply_len, "wpa_state=DISCONNECTED");
+            goto finalret;
+        }
+        if (strstr(cmd, "wlan0 SCAN "))
+        {
+            snprintf(reply, *reply_len, "OK");
+            send_data("IFNAME=wlan0 CTRL-EVENT-SCAN-STARTED");
+            send_data("IFNAME=wlan0 CTRL-EVENT-SCAN-RESULTS");
+            goto finalret;
+        }
+        if (strstr(cmd, "wlan0 BSS_FLUSH "))
+        {
+            snprintf(reply, *reply_len, "OK");
+            goto finalret;
+        }
+        if (strstr(cmd, "wlan0 BSS RANGE=0"))
+        {
+            char ssid[PROPERTY_VALUE_MAX] = {0};
+            char mac_address[PROPERTY_VALUE_MAX] = {0};
+            char prop[92] = {0};
+            property_get("ro.ananbox.wifi.bssid", mac_address, default_mac);
+            property_get("ro.ananbox.wifi.ssid", ssid, default_ssid);
+            snprintf(reply, *reply_len,
+            "ie=\nid=0\nbssid=%s\nfreq=2437\nlevel=-41\ntsf=0000005475069290\nflags=[ESS]\nssid=%s\n####", 
+            mac_address, ssid);
+            goto finalret;
+        }
+        if (strstr(cmd, "wlan0 SET_NETWORK ") || strstr(cmd, "wlan0 SAVE_CONFIG"))
+        {
+            snprintf(reply, *reply_len, "OK");
+            goto finalret;
+        }
+        if (strstr(cmd, "wlan0 ENABLE_NETWORK "))
+        {
+            char databuf[0x100] = {0};
+            char ssid[PROPERTY_VALUE_MAX] = {0};
+            char mac_address[PROPERTY_VALUE_MAX] = {0};
+            property_get("ro.ananbox.wifi.bssid", mac_address, default_mac);
+            property_get("ro.ananbox.wifi.ssid", ssid, default_ssid);
+            snprintf(reply, *reply_len, "OK");
+            snprintf(databuf, sizeof(databuf), "IFNAME=wlan0 Trying to associate with %s (SSID='%s' freq=2437 MHz)", mac_address, ssid);
+            send_data(databuf);
+            goto finalret;
+        }
+        if (strstr(cmd, "wlan0 SELECT_NETWORK "))
+        {
+            snprintf(reply, *reply_len, "OK");
+            goto finalret;
+        }
+        if (strstr(cmd, "wlan0 RECONNECT"))
+        {
+            char databuf[0x100] = {0};
+            char ssid[PROPERTY_VALUE_MAX] = {0};
+            char mac_address[PROPERTY_VALUE_MAX] = {0};
+            property_get("ro.ananbox.wifi.bssid", mac_address, default_mac);
+            property_get("ro.ananbox.wifi.ssid", ssid, default_ssid);
+            snprintf(databuf, sizeof(databuf), "IFNAME=wlan0 CTRL-EVENT-STATE-CHANGE id=0 state=5 BSSID=%s SSID=%s", mac_address, ssid);
+            send_data(databuf);
+            snprintf(databuf, sizeof(databuf), "IFNAME=wlan0 CTRL-EVENT-STATE-CHANGE id=0 state=6 BSSID=%s SSID=%s", mac_address, ssid);
+            send_data(databuf);
+            snprintf(databuf, sizeof(databuf), "IFNAME=wlan0 Associated with %s", mac_address);
+            send_data(databuf);
+            snprintf(databuf, sizeof(databuf), "IFNAME=wlan0 WPA: Key negotiation completed with %s [PTK=CCMP GTK=CCMP]", mac_address);
+            send_data(databuf);
+            snprintf(databuf, sizeof(databuf), "IFNAME=wlan0 CTRL-EVENT-CONNECTED - Connection to %s completed [id=0 id_str=]", mac_address);
+            send_data(databuf);
+            snprintf(databuf, sizeof(databuf), "IFNAME=wlan0 CTRL-EVENT-STATE-CHANGE id=0 state=9 BSSID=%s SSID=%s", mac_address, ssid);
+            send_data(databuf);
+            is_wifi_reconnect = 1;
+            snprintf(reply, *reply_len, "OK");
+            goto finalret;
+        }
+        if (strstr(cmd, "wlan0 SIGNAL_POLL"))
+        {
+            snprintf(reply, *reply_len, "RSSI=-45\nLINKSPEED=72\nNOISE=9999\nFREQUENCY=2437");
+            goto finalret;
+        }
+        if (strstr(cmd, "wlan0 BLACKLIST clear") || strstr(cmd, "wlan0 SET ")) {
+            snprintf(reply, *reply_len, "OK");
+            goto finalret;
+        }
+        if (!strcmp(cmd, "IFNAME=wlan0 TERMINATE"))
+        {
+            char databuf[0x100] = {0};
+            char ssid[PROPERTY_VALUE_MAX] = {0};
+            char mac_address[PROPERTY_VALUE_MAX] = {0};
+            property_get("ro.ananbox.wifi.bssid", mac_address, default_mac);
+            property_get("ro.ananbox.wifi.ssid", ssid, default_ssid);
+            snprintf(databuf, sizeof(databuf), "IFNAME=wlan0 CTRL-EVENT-DISCONNECTED bssid=%s reason=3 locally_generated=1", mac_address);
+            send_data(databuf);
+            snprintf(databuf, sizeof(databuf), "IFNAME=wlan0 CTRL-EVENT-STATE-CHANGE id=0 state=0 BSSID=%s SSID=%s", mac_address, ssid);
+            send_data(databuf);
+            snprintf(databuf, sizeof(databuf), "IFNAME=wlan0 CTRL-EVENT-BSS-REMOVED 0 %s", mac_address);
+            send_data(databuf);
+            send_data("IFNAME=wlan0 CTRL-EVENT-TERMINATING");
+            snprintf(reply, *reply_len, "OK");
+            goto finalret;
+        }
+    }
+    reply_len = 0;
+    ALOGE("REDF-LOG wifi_send_command unknown, cmd[%s]", cmd);
+    return -1;
+finalret:
+    *reply_len = strlen(reply);
     return 0;
 }
 
 int wifi_supplicant_connection_active()
 {
-    char supp_status[PROPERTY_VALUE_MAX] = {'\0'};
-
-    if (property_get(supplicant_prop_name, supp_status, NULL)) {
-        if (strcmp(supp_status, "stopped") == 0)
-            return -1;
-    }
-
-    return 0;
+    ALOGD("REDF-LOG wifi_supplicant_connection_active\n");
+    return is_wifi_supplicant_connection_active ? 0 : -1;
 }
 
 int wifi_ctrl_recv(char *reply, size_t *reply_len)
 {
-    int res;
-    int ctrlfd = wpa_ctrl_get_fd(monitor_conn);
-    struct pollfd rfds[2];
-
-    memset(rfds, 0, 2 * sizeof(struct pollfd));
-    rfds[0].fd = ctrlfd;
-    rfds[0].events |= POLLIN;
-    rfds[1].fd = exit_sockets[1];
-    rfds[1].events |= POLLIN;
-    do {
-        res = TEMP_FAILURE_RETRY(poll(rfds, 2, 30000));
-        if (res < 0) {
-            ALOGE("Error poll = %d", res);
-            return res;
-        } else if (res == 0) {
-            /* timed out, check if supplicant is active
-             * or not ..
-             */
-            res = wifi_supplicant_connection_active();
-            if (res < 0)
-                return -2;
-        }
-    } while (res == 0);
-
-    if (rfds[0].revents & POLLIN) {
-        return wpa_ctrl_recv(monitor_conn, reply, reply_len);
-    }
-
-    /* it is not rfds[0], then it must be rfts[1] (i.e. the exit socket)
-     * or we timed out. In either case, this call has failed ..
-     */
+    ALOGE("REDF-LOG wifi_ctrl_recv\n");
     return -2;
 }
 
 int wifi_wait_on_socket(char *buf, size_t buflen)
 {
     size_t nread = buflen - 1;
-    int result;
-    char *match, *match2;
+    int read_fd = sock_sv[0];
+    if (is_ctrl_event_connected && read_fd != -1)
+    {
+        int read_len = read(read_fd, buf, nread);
+        if (read_len < 0)
+        {
+            ALOGE("REDF-LOG wifi_wait_on_socket read socksv failed! %s\n", strerror(errno));
+            close(read_fd);
+            close(sock_sv[1]);
+            sock_sv[0] = -1;
+            sock_sv[1] = -1;
 
-    if (monitor_conn == NULL) {
-        return snprintf(buf, buflen, "IFNAME=%s %s - connection closed",
-                        primary_iface, WPA_EVENT_TERMINATING);
-    }
-
-    result = wifi_ctrl_recv(buf, &nread);
-
-    /* Terminate reception on exit socket */
-    if (result == -2) {
-        return snprintf(buf, buflen, "IFNAME=%s %s - connection closed",
-                        primary_iface, WPA_EVENT_TERMINATING);
-    }
-
-    if (result < 0) {
-        ALOGD("wifi_ctrl_recv failed: %s\n", strerror(errno));
-        return snprintf(buf, buflen, "IFNAME=%s %s - recv error",
-                        primary_iface, WPA_EVENT_TERMINATING);
-    }
-    buf[nread] = '\0';
-    /* Check for EOF on the socket */
-    if (result == 0 && nread == 0) {
-        /* Fabricate an event to pass up */
-        ALOGD("Received EOF on supplicant socket\n");
-        return snprintf(buf, buflen, "IFNAME=%s %s - signal 0 received",
-                        primary_iface, WPA_EVENT_TERMINATING);
-    }
-    /*
-     * Events strings are in the format
-     *
-     *     IFNAME=iface <N>CTRL-EVENT-XXX 
-     *        or
-     *     <N>CTRL-EVENT-XXX 
-     *
-     * where N is the message level in numerical form (0=VERBOSE, 1=DEBUG,
-     * etc.) and XXX is the event name. The level information is not useful
-     * to us, so strip it off.
-     */
-
-    if (strncmp(buf, IFNAME, IFNAMELEN) == 0) {
-        match = strchr(buf, ' ');
-        if (match != NULL) {
-            if (match[1] == '<') {
-                match2 = strchr(match + 2, '>');
-                if (match2 != NULL) {
-                    nread -= (match2 - match);
-                    memmove(match + 1, match2 + 1, nread - (match - buf) + 1);
-                }
-            }
-        } else {
-            return snprintf(buf, buflen, "%s", WPA_EVENT_IGNORE);
+            return snprintf(buf, buflen, "IFNAME=%s %s - connection closed", "wlan0", WPA_EVENT_TERMINATING);
         }
-    } else if (buf[0] == '<') {
-        match = strchr(buf, '>');
-        if (match != NULL) {
-            nread -= (match + 1 - buf);
-            memmove(buf, match + 1, nread + 1);
-            ALOGV("supplicant generated event without interface - %s\n", buf);
+        buf[read_len] = '\0';
+        if (strstr(buf, "wlan CTRL-EVENT-SCAN-STARTED"))
+        {
+            usleep(0x186A0u);
         }
-    } else {
-        /* let the event go as is! */
-        ALOGW("supplicant generated event without interface and without message level - %s\n", buf);
+        if (strstr(buf, "wlan CTRL-EVENT-TERMINATING"))
+        {
+            is_ctrl_event_connected = 0;
+        }
+        return read_len;
     }
-
-    return nread;
+    else
+    {
+        return snprintf(buf, buflen, "IFNAME=%s %s - connection closed", "wlan0", WPA_EVENT_TERMINATING);
+    }
 }
 
 int wifi_wait_for_event(char *buf, size_t buflen)
@@ -756,41 +578,12 @@ int wifi_wait_for_event(char *buf, size_t buflen)
 
 void wifi_close_sockets()
 {
-    if (ctrl_conn != NULL) {
-        wpa_ctrl_close(ctrl_conn);
-        ctrl_conn = NULL;
-    }
-
-    if (monitor_conn != NULL) {
-        wpa_ctrl_close(monitor_conn);
-        monitor_conn = NULL;
-    }
-
-    if (exit_sockets[0] >= 0) {
-        close(exit_sockets[0]);
-        exit_sockets[0] = -1;
-    }
-
-    if (exit_sockets[1] >= 0) {
-        close(exit_sockets[1]);
-        exit_sockets[1] = -1;
-    }
+    ALOGD("REDF-LOG wifi_close_sockets\n");
 }
 
 void wifi_close_supplicant_connection()
 {
-    char supp_status[PROPERTY_VALUE_MAX] = {'\0'};
-    int count = 50; /* wait at most 5 seconds to ensure init has stopped stupplicant */
-
-    wifi_close_sockets();
-
-    while (count-- > 0) {
-        if (property_get(supplicant_prop_name, supp_status, NULL)) {
-            if (strcmp(supp_status, "stopped") == 0)
-                return;
-        }
-        usleep(100000);
-    }
+    is_wifi_supplicant_connection_active = 0;
 }
 
 int wifi_command(const char *command, char *reply, size_t *reply_len)
@@ -800,35 +593,12 @@ int wifi_command(const char *command, char *reply, size_t *reply_len)
 
 const char *wifi_get_fw_path(int fw_type)
 {
-    switch (fw_type) {
-    case WIFI_GET_FW_PATH_STA:
-        return WIFI_DRIVER_FW_PATH_STA;
-    case WIFI_GET_FW_PATH_AP:
-        return WIFI_DRIVER_FW_PATH_AP;
-    case WIFI_GET_FW_PATH_P2P:
-        return WIFI_DRIVER_FW_PATH_P2P;
-    }
+    ALOGD("REDF-LOG wifi_get_fw_path, fw_type: %d\n", fw_type);
     return NULL;
 }
 
 int wifi_change_fw_path(const char *fwpath)
 {
-    int len;
-    int fd;
-    int ret = 0;
-
-    if (!fwpath)
-        return ret;
-    fd = TEMP_FAILURE_RETRY(open(WIFI_DRIVER_FW_PATH_PARAM, O_WRONLY));
-    if (fd < 0) {
-        ALOGE("Failed to open wlan fw path param (%s)", strerror(errno));
-        return -1;
-    }
-    len = strlen(fwpath) + 1;
-    if (TEMP_FAILURE_RETRY(write(fd, fwpath, len)) != len) {
-        ALOGE("Failed to write wlan fw path param (%s)", strerror(errno));
-        ret = -1;
-    }
-    close(fd);
-    return ret;
+    ALOGD("REDF-LOG wifi_change_fw_path, fwpath: %s\n", fwpath);
+    return 0;
 }
